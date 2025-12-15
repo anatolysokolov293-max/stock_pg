@@ -1,0 +1,205 @@
+План такой: берём классическую схему data feed > strategy > risk/execution > broker из live?движков, добавляем твои правила риска (2% капитала на сделку, стоп не дальше 20% от цены входа) и сразу проектируем обработку сбоев как отдельный слой (error handling + health?monitoring).[1]
+
+## Архитектура, которую заимствуем
+
+1) Разделение ролей из Zipline/Backtrader?Live:  
+- Strategy: чистая логика сигналов, не знает про капитал, лимиты, брокера.  
+- DataFeed: поставщик минуток и агрегированных ТФ.  
+- Broker: адаптер к реальному/фейковому брокеру.  
+- Risk/Execution: слой между Strategy и Broker, который решает, какие сигналы превратить в заявки и с каким объёмом.  
+
+2) Модель событий:  
+- по закрытию бара (event “BAR_CLOSE”) по конкретному `symbol/timeframe` вызываем все стратегии, которые сидят на этой связке;  
+- стратегия возвращает декларативный `Signal`, execution?слой уже решает, что с ним делать.  
+
+3) Хранение состояния:  
+- как в большинстве движков, позиции и ордера храним отдельно (у тебя это будут `live_positions`, `live_orders`, `live_trades`), а `strategy_universe` — только конфиг + параметры.
+
+## Блок 1. Расширяем strategy_universe под риск
+
+1) Договориться о семантике полей:  
+- `risk_per_trade` = 0.02 (2% капитала на сделку) для всех стратегий по умолчанию.  
+- `max_stop_loss_fraction` (новая колонка) = 0.2 (20% максимальный допуск от входа до стопа).  
+- при необходимости позже добавить `max_positions_per_strategy` и `max_total_positions`.  
+
+2) Миграция БД:  
+- добавить колонку `max_stop_loss_fraction double precision DEFAULT 0.2 NOT NULL`;  
+- проставить `risk_per_trade = 0.02` для всех `enabled` стратегий, остальные можно оставить NULL до ручной настройки.  
+
+3) Формализовать правило:  
+- стратегия обязана выставлять стоп по каждому входу;  
+- если расстояние от входа до стопа > 20%, execution?слой сигнал отвергает и логирует ошибку “too_wide_stop”.
+
+## Блок 2. Интерфейс стратегии и формат Signal
+
+1) Описать интерфейс стратегии (Python, псевдокод):  
+- `on_bar(context) -> Signal | None`.  
+- `Context` содержит:  
+  - `symbol`, `timeframe`, timestamp;  
+  - последние N баров (из кэша/БД);  
+  - текущую позицию по этой стратегии (size, avg_price, direction);  
+  - активные ордера;  
+  - `params` из `params_json`;  
+  - справочную информацию: equity, risk_per_trade, max_stop_loss_fraction (только для расчётов, стратегия может их использовать, но не обязана).  
+
+2) Формат `Signal` (DTO, который сериализуем в JSON и в БД):  
+- `type`: `OPEN`, `CLOSE`, `REVERSE`, `ADD`;  
+- `direction`: `LONG`, `SHORT`, `FLAT`;  
+- `entry_type`: `MARKET` / `LIMIT` / `STOP`;  
+- `entry_price`: желаемая цена (может быть null для MARKET);  
+- `stop_loss`: обязательный уровень стопа;  
+- `take_profit`: опциональный уровень;  
+- `size_mode`: `'RISK_FRACTION'` (всегда так для начала);  
+- `size_value`: доля риска относительно `risk_per_trade` (по умолчанию 1.0 > использовать 100% `risk_per_trade`);  
+- `meta`: свободный JSON (tag, comment, debug?инфо).  
+
+3) Стратегии не считают размер в штуках, только задают `stop_loss` и `size_value` (в долях от допускаемого риска на сделку).  
+Execution?слой сам применяет твои 2% и 20% по формуле.
+
+## Блок 3. DataFeed: минутки > агрегированные ТФ
+
+1) Поток данных:  
+- подписка на минутные свечи по всем нужным символам;  
+- все минутки складываем в таблицу `candles_1m` + в in?memory кэш.  
+
+2) Агрегатор таймфреймов:  
+- сервис, который из `candles_1m` собирает бары 5m/15m/1h/1d по классическим правилам (open первого бара, high/low максимум/минимум, close последнего и суммирование объёма);  
+- на закрытии агрегированного бара пишет его в таблицу `candles_5m`, `candles_15m`, … и генерирует событие “BAR_CLOSE(symbol, timeframe, ts)”.  
+
+3) Подготовка контекста:  
+- по событию “BAR_CLOSE” агрегатор:  
+  - вытаскивает последние N баров из кэша/БД для соответствующего `symbol/timeframe`;  
+  - передаёт их в модуль “StrategyRunner”, который уже опрашивает стратегии.
+
+## Блок 4. StrategyRunner и live_signals
+
+1) StrategyRunner:  
+- по событию “BAR_CLOSE(symbol, timeframe, ts)”:  
+  - выбирает из `strategy_universe` все строки с `symbol`, `timeframe`, `enabled = true`, `mode IN ('paper','live')`;[1]
+  - для каждой строит `Context` (данные, позиция, ордера, параметры, risk?поля);  
+  - вызывает `on_bar(context)`.  
+
+2) Обработка результатов:  
+- если стратегия возвращает `None` > ничего не пишем.  
+- если вернулся `Signal`:  
+  - валидация: есть ли `stop_loss`, корректное направление, нет NaN, адекватная цена;  
+  - если валидация не проходит > логируем в `live_errors`, сигнал не пишем.  
+- валидный сигнал пишется в `live_signals`:  
+  - `id`, `strategy_universe_id`, `symbol`, `timeframe`, `signal_timestamp`, `bar_timestamp`, `signal_json`, `created_at`.
+
+3) Разделение обязанностей:  
+- StrategyRunner только пишет в `live_signals`, никаких ордеров и брокера.
+
+## Блок 5. Risk/Execution с учётом 2% и 20%
+
+1) Модуль ExecutionEngine:  
+- периодически (или по триггеру) читает новые строки из `live_signals` с флагом `processed = false`;  
+- для каждого сигнала:  
+  - подтягивает `strategy_universe` (включая `risk_per_trade`, `max_stop_loss_fraction`, `mode`, `priority`);[1]
+  - подтягивает состояние счёта (equity, free_cash) и текущую позицию.  
+
+2) Расчёт объёма:  
+- проверяем расстояние до стопа: `risk_span = abs(entry_price - stop_loss) / entry_price`;  
+- если `risk_span > max_stop_loss_fraction (0.2)` > отказ, пишем в `live_errors` запись “too_wide_stop”.  
+- допустимая денежная потеря по сделке: `max_loss_money = risk_per_trade * equity` (2%).  
+- требуемый объём:  
+  - `size_money = max_loss_money / risk_span`;  
+  - `size_lots = floor(size_money / (entry_price * lot_size))`;  
+- если `size_lots <= 0` > отказ “size_too_small”.  
+
+3) Глобальные лимиты:  
+- проверяем:  
+  - `total_open_positions` < `MAX_TOTAL_POSITIONS`;  
+  - `open_positions_for_strategy` < `max_positions_per_strategy` (если введём поле);  
+  - `free_cash` ? `size_lots * entry_price * lot_size * safety_coeff`.  
+- если не хватает кэша > можно попробовать уменьшить размер (например, до максимально доступного) или отказать с записью “insufficient_cash”.
+
+4) Формирование ордера:  
+- создание записи в `live_orders`:  
+  - link на `live_signals.id`, `strategy_universe.id`;  
+  - `side`, `quantity`, `price`, `order_type`, стоп/тейк уровни;  
+  - статус `NEW`.  
+- передача в модуль broker?adapter (FakeBroker/Tinkoff).
+
+## Блок 6. Брокерский адаптер и устойчивость
+
+1) Интерфейс Broker:  
+- `place_order(order)` > `broker_order_id` или ошибка;  
+- `cancel_order(order_id)`;  
+- `get_positions()`, `get_cash()`, `subscribe_fills()`.  
+
+2) FakeBroker:  
+- исполняет заявки по цене следующего бара (или close текущего) с заданным спредом/проскальзыванием;  
+- обновляет `live_trades`, `live_positions` и статус в `live_orders`.  
+
+3) Реальный брокер (Tinkoff):  
+- адаптер поверх Tinkoff API, но с тем же интерфейсом;  
+- все ошибки сети/брокера:  
+  - ретрай по экспоненциальной схеме;  
+  - если не удалось — статус `REJECTED` + запись в `live_errors` с полным текстом ошибки.
+
+## Блок 7. Обработка сбоев и ошибок
+
+1) Классы ошибок:  
+- внешние (data feed, брокер, сеть);  
+- внутренние (исключения в стратегиях, баги в execution);  
+- риск?ошибки (недостаточно капитала, слишком широкий стоп, превышение лимитов).  
+
+2) Общие правила:  
+- ни одна ошибка не должна останавливать основной цикл;  
+- все ошибки логируются в `live_errors` с полями: `source` (strategy_runner / execution / broker / data_feed), `severity` (warning/error/critical), `strategy_universe_id` (опционально), `symbol`, `timeframe`, текст, stack trace (для внутренних).  
+
+3) Fail?safe режимы:  
+- если data feed недоступен > не вызываем стратегии, просто ждём восстановления, в `live_errors` фиксируем “data_feed_down”.  
+- если брокер недоступен:  
+  - stop?trading флаг (глобальный), execution перестаёт отправлять новые заявки, но продолжает считать сигналы и логировать, что ордера не отправлены;  
+  - после восстановления связи можно принять решение вручную (дооткрывать/закрывать позиции).  
+- при массовом приходе котировок после потери связи:  
+  - игнорируем все бара?события с timestamp в прошлом (или агрегируем их в один “текущий” бар), чтобы не настрелять сигналов задним числом;  
+  - можно сделать конфиг: “при gap > N минут работать только в safe?mode (не открывать новые позиции, только управлять текущими)”.
+
+4) Health?monitoring:  
+- завести таблицу/метрику `service_status`: последний heartbeat от data feed, strategy runner, execution, broker adapter;  
+- если какой?то компонент не подаёт признаков жизни N секунд > в интерфейсе показывать алерт и ставить глобальный флаг stop?trading.
+
+## Блок 8. Порядок реализации
+
+1) Миграция и конфиги:  
+- расширить `strategy_universe` (`max_stop_loss_fraction`), проставить `risk_per_trade = 0.02`.[1]
+
+2) DataFeed и агрегатор ТФ:  
+- реализовать подписку на минутки, таблицу `candles_1m` и сервис генерации 5m/15m/1h/1d с событием “BAR_CLOSE”.  
+
+3) StrategyRunner + live_signals:  
+- DTO `Context` и `Signal`;  
+- обвязка вызова стратегий и запись сигналов.  
+
+4) ExecutionEngine с твоими правилами 2% и 20% + глобальные лимиты;  
+5) FakeBroker (полный цикл на исторических данных);  
+6) Логика ошибок и мониторинг (таблица `live_errors`, health?checks);  
+7) Интеграция с Tinkoff Sandbox на том же интерфейсе Broker.
+
+Если хочешь, дальше можно расписать конкретные схемы таблиц `live_signals`, `live_orders`, `live_errors` и пример Python?структур `Context`/`Signal` под твой текущий код.
+
+_______________________________________
+В ExecutionEngine можно будет добавить больше глобальных лимитов (дневная просадка, лимит по инструменту), но это уже итеративное расширение, не блокирующее дальнейшую работу.
+Для StrategyRunner/ExecutionEngine/aggregator полезно потом сделать небольшой “монитор” (веб?страницу логов/heartbeats), но это тоже не блокер.
+
+Конвенция по кодам ошибок
+Предлагаю договориться так (без отдельной таблицы):
+
+source: 'data_feed', 'strategy_runner', 'execution', 'broker', 'risk', 'system'.
+
+severity: 'info', 'warning', 'error', 'critical'.
+
+message (короткий код), примерный набор:
+
+data feed: data_feed_down, no_market_price_for_symbol, bar_too_old.
+
+broker: broker_down, unsupported_order_type, order_execution_failed.
+
+strategy: strategy_exception, invalid_signal_format, strategy_not_found.
+
+execution/risk: too_wide_stop, insufficient_cash, max_total_positions_reached, max_positions_per_strategy_reached, trading_disabled_by_control, new_positions_disabled_by_control.
+
+Это уже частично используется в текущем коде; главное — придерживаться этих строк при новых логах.

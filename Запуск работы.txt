@@ -1,0 +1,74 @@
+Для прогона полного pipeline по истории через FakeBroker уже почти всё есть; нужно только подготовить несколько условий и небольшие настройки.?
+
+Что должно быть подготовлено в БД
+В strategy_universe для стратегий, которые хочешь тестировать:
+
+enabled = true,
+
+mode = 'paper',
+
+risk_per_trade заполнен (0.02),
+
+при необходимости max_positions_per_strategy/max_total_positions (можно оставить NULL).
+
+В symbols для соответствующих тикеров:
+
+корректный id, ticker, lot_size (минимум 1).
+
+Свечи:
+
+candles_1m заполнена историей,
+
+datafeed_aggregator.py прогнан (или будет прогоняться), чтобы агрегировать candles_5m/... с is_gap/gap_dir.
+
+Начальное состояние счёта:
+
+account_state (id=1) с разумными equity и free_cash (например, 1 000 000).
+
+Глобальный контроль:
+
+trading_control (id=1): allow_trading = true, allow_new_positions = true.
+
+Что должно быть на стороне кода
+Простые Python?стратегии в пакете strategies, имена которых совпадают с strategy_universe.strategy_id, и функция on_bar(context) возвращает сигнал нужного формата.
+
+Запущены (по очереди или параллельно) демоны:
+
+datafeed_aggregator.py (если агрегаты ещё не построены или хочешь симулировать live?режим),
+
+strategy_runner.py,
+
+execution_engine.py,
+
+fake_broker.py,
+
+опционально health_monitor.py (для наблюдения, но на тесты не обязателен).
+
+Типовой сценарий прогона на истории
+Вариант 1 (быстрый офлайн):
+
+datafeed_aggregator.py уже агрегировал всю историю (candles_5m/... готовые).
+
+Запускаешь strategy_runner.py > он пройдётся по всем барам (по порядку timestamp) и напишет live_signals.
+
+Затем execution_engine.py > обработает сигналы, создаст live_orders.
+
+Затем fake_broker.py > “исполнит” ордера, заполнив live_trades и live_positions.
+
+Вариант 2 (максимально близко к live):
+
+Запускаешь datafeed_aggregator.py на исторической минутной ленте (как если бы она стримилась),
+
+параллельно strategy_runner.py, execution_engine.py, fake_broker.py.
+
+Всё работает как единая система, только время подаётся “с прошлого”.
+
+Для начала, чтобы проверить связку, проще использовать вариант 1: подготовленная история > Runner > Execution > FakeBroker.
+
+Если хочешь, следующим шагом можно:
+
+описать простейший пример стратегии (например, strategies/example_ma.py с пересечением МА),
+
+настроить пару строк в strategy_universe под неё,
+
+и пошагово расписать SQL/команды запуска, чтобы ты мог выполнить полный тест и посмотреть, что оказывается в live_positions/live_trades/live_errors.

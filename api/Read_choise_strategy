@@ -1,0 +1,84 @@
+Механизм отбора сейчас состоит из трёх файлов: `select_universe.php`, `universe_ui.php` и `apply_universe.php`, плюс таблицы `strategy_universe` в БД.[1][2]
+
+## Общая идея
+
+- Источник данных — таблица `backtest_runs`, где лежат все бэктесты с метриками и JSON‑ами сделок/индикаторов.[1]
+- `select_universe.php` выбирает из `backtest_runs` только лучшие прогоны (`is_best = 1`) по заданным фильтрам, считает скоринг, группирует по связке `symbol + timeframe + strategy`, и сравнивает результат с текущим `strategy_universe`.[1]
+- `universe_ui.php` даёт веб‑интерфейс для выбора диапазона дат, порогов по метрикам и score, показывает кандидатов (INSERT/UPDATE) и позволяет отметить, какие из них применить.[3]
+- `apply_universe.php` принимает выбранные кандидаты в виде JSON и через `INSERT ... ON CONFLICT` / `UPDATE` записывает изменения в `strategy_universe`.[2]
+
+## select_universe.php
+
+Функции скрипта:[1]
+
+- Принимает GET‑параметры: `date_from`, `date_to` (формат `dd-mm-YYYY`), пороги `min_sharpe`, `min_pf`, `max_dd`, `min_trades`, `min_cagr`.
+- Делает выборку из `backtest_runs`:
+  - `is_best = 1`, есть `trades_json` и `indicators_json`;
+  - фильтр по дате `created_at::date` в указанном диапазоне;
+  - фильтры по метрикам;
+  - учитывает, что `max_dd` в БД хранится со знаком минус, поэтому в фильтре и скоринге используется `-max_dd` (положительная просадка в процентах).
+- Подтягивает веса таймфреймов из `timeframe_weights` и тикеры из `symbols` (FIGI пока `null`).
+- Считает `base_score` и `final_score` по метрикам и весу таймфрейма, группирует по `symbol + timeframe + strategy_id`, оставляя лучший `final_score` в каждой группе.
+- Для каждой группы проверяет, есть ли уже запись в `strategy_universe`; формирует JSON‑массив объектов:
+  - `action = "insert"` для новых связок (нет записи в universe);
+  - `action = "update_candidate"` для существующих, с блоками `existing` (старые метрики/score) и `new`/`metrics` (новые).
+
+Этот JSON потребляет фронт и затем отправляет выбранную часть в `apply_universe.php`.[1]
+
+## universe_ui.php
+
+Функции фронтенда:[3]
+
+- Формирует панель фильтров:
+  - даты `date_from`/`date_to`;
+  - пороги `Min Sharpe / Min PF / Max DD / Min Trades / Min CAGR`;
+  - пороги по `Min Score new` и `Min Score old`.
+- По кнопке “Загрузить кандидатов” делает `fetch` к `select_universe.php` с параметрами, получает JSON списка кандидатов.
+- Дополнительно на фронте фильтрует элементы по `final_score` (новый score) и по старому `score`, если задан `Min Score old`.
+- Рендерит таблицу:
+  - по строке на кандидата, с колонками Symbol, TF, Strategy, Action (INSERT/UPDATE);
+  - показывает метрики в формате `old → new`, подсвечивая улучшения/ухудшения;
+  - каждая строка имеет чекбокс и индекс, чтобы можно было выбрать подмножество для применения.
+- Хранит последний загруженный массив в `lastLoadedItems` и по кнопке “Применить выбранное” собирает отмеченные строки и отправляет их POST‑ом (JSON) в `apply_universe.php`.[3]
+
+## apply_universe.php
+
+Функции скрипта:[2]
+
+- Принимает POST‑тело с JSON‑массивом объектов, каждый в формате, возвращаемом `select_universe.php` (действия `insert` и `update_candidate`).
+- Оборачивает операции в транзакцию.
+- Для `action = "insert"`:
+  - берёт `symbol`, `timeframe`, `strategy_id`, `params_json`, метрики (`sharpe`, `max_dd`, `pf`, `trades`, `cagr`), `backtest_run_id`, `window_start` и `final_score`;
+  - выполняет `INSERT INTO strategy_universe (...) VALUES (...) ON CONFLICT (symbol, timeframe, strategy_id) DO UPDATE SET ...`, при конфликте обновляя метрики, score и технические поля (mode, priority и т.п.).
+- Для `action = "update_candidate"`:
+  - использует `existing.id` как ключ;
+  - выполняет `UPDATE strategy_universe SET ... WHERE id = :id` с новыми метриками и score.
+- В завершение отдаёт JSON с количеством вставок и обновлений или ошибку.[2]
+
+## Таблица strategy_universe
+
+Структура (ключевые поля):[4]
+
+- `id bigint` — PK.
+- `symbol text NOT NULL` — тикер инструмента.
+- `figi text` — опциональный внешний идентификатор (пока не используется, может быть NULL).
+- `timeframe text NOT NULL` — строковый таймфрейм (например, `5m`, `1h`, `1d`).
+- `strategy_id text NOT NULL` — идентификатор/имя стратегии.
+- `params_json jsonb` — параметры стратегии для данного инструмента/таймфрейма.
+- Метрики: `sharpe double precision`, `max_dd double precision`, `pf double precision`, `trades integer`, `cagr double precision`.
+- Связка с бэктестом: `backtest_run_id bigint`, `backtest_started_at timestamptz`.
+- Скоринг: `score double precision`, `grade text`.
+- Управляющие поля:
+  - `enabled boolean NOT NULL DEFAULT false` — включена ли стратегия в реальной торговле;
+  - `mode text NOT NULL DEFAULT 'backtest'` — режим (backtest/paper/live);
+  - `priority integer NOT NULL DEFAULT 0`;
+  - `risk_per_trade double precision`.
+- Технические: `created_at timestamptz NOT NULL DEFAULT now()`, `updated_at timestamptz NOT NULL DEFAULT now()`, `comment text`.[4]
+
+В итоге `strategy_universe` хранит только утверждённые связки symbol–timeframe–strategy с выбранными параметрами и метриками, а `select_universe.php + universe_ui.php + apply_universe.php` реализуют полный цикл отбора, визуальной проверки и применения новых кандидатов из истории бэктестов.
+
+[1](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/148181912/5471caf9-3fc3-4049-af42-06bc248342f9/select_universe.php)
+[2](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/148181912/2178fa16-bd18-48ae-8db1-df2c8c86d43c/apply_universe.php)
+[3](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/148181912/332a8f64-3e0f-4c3f-9ee1-2323dc335d1f/select_universe.php)
+[4](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/148181912/63a9d216-0f2f-4822-8e11-9244af4b65db/apply_universe.php)
+[5](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/148181912/6bc374d8-342d-4cf4-a25f-1b652f74c952/select_universe.php)

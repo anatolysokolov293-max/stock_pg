@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Backtest Chart</title>
+    <script src="https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
+    <link rel="stylesheet" href="css/chart.css">
+</head>
+<body>
+    <div id="info-panel">
+        <div class="info-row">
+            <span class="info-label">Символ:</span>
+            <span id="info-symbol" class="info-value">-</span>
+        </div>
+        <div class="info-row">
+            <span class="info-label">Стратегия:</span>
+            <span id="info-strategy" class="info-value">-</span>
+        </div>
+        <div class="info-row">
+            <span class="info-label">Таймфрейм:</span>
+            <span id="info-timeframe" class="info-value">-</span>
+        </div>
+        <div class="info-row">
+            <span class="info-label">Параметры:</span>
+            <span id="info-params" class="info-value">-</span>
+        </div>
+        <div class="info-row">
+            <span class="info-label">Период:</span>
+            <span id="info-period" class="info-value">-</span>
+        </div>
+    </div>
+
+    <div id="controls">
+        <div class="control-item">
+            <input type="checkbox" id="showTradeLines" />
+            <label for="showTradeLines">Соединить входы и выходы линиями</label>
+        </div>
+        <div class="control-item">
+            <input type="checkbox" id="showEntryMarkers" checked />
+            <label for="showEntryMarkers">Показать входы</label>
+        </div>
+        <div class="control-item">
+            <input type="checkbox" id="showExitMarkers" checked />
+            <label for="showExitMarkers">Показать выходы</label>
+        </div>
+        <div class="control-item">
+            <label for="lotSize">Количество лотов:</label>
+            <input type="number" id="lotSize" value="10" min="1" max="1000" style="width: 80px;">
+            <button id="recalcEquity">Пересчитать</button>
+        </div>
+        <button id="resetSizes">Сбросить размеры</button>
+    </div>
+
+    <div id="charts-container">
+        <!-- Основной график, осцилляторы и таблица сделок будут добавляться динамически -->
+    </div>
+
+    <script src="js/chart-utils.js"></script>
+    <script src="js/chart-panels.js"></script>
+    <script src="js/chart-trades.js"></script>
+    <script src="js/chart-equity.js"></script>
+    <script src="js/chart-hotkeys.js"></script>
+    <script src="js/chart-main.js"></script>
+</body>
+</html>
