@@ -18,3 +18,33 @@ git push (без параметров, так как tracking ветка уже 
 переключиться с master на main или оставить как есть,
 
 настроить работу с ветками/feature‑branch под твой флоу разработки.
+
+
+
+Как выгружать только структуру (без данных)
+Через pg_dump (из PowerShell / терминала, где есть pg_dump):
+
+bash
+pg_dump -h localhost -p 5432 -U postgres -d stock_db --schema-only > db_schema.sql
+--schema-only говорит выгружать только структуру (таблицы, индексы, последовательности и т.п.), без данных.​
+
+Файл db_schema.sql клади в твой проект (C:\xampp\htdocs\stock_pg) и коммить в Git как обычный текстовый файл.
+
+Типичный рабочий флоу
+Меняешь структуру БД (ALTER TABLE и т.п.).
+
+Выполняешь pg_dump --schema-only ... > db_schema.sql, перезаписывая файл схемы.​
+
+В репозитории:
+
+bash
+git add db_schema.sql
+git commit -m "Обновил структуру БД"
+git push
+Так ты всегда сможешь увидеть diff по схеме, откатиться, поднять такую же структуру на другом сервере (psql -d твоя_бд -f db_schema.sql).​
+
+
+Обновление всего
+git add .
+git commit -m "описание изменений"
+git push
